@@ -285,3 +285,99 @@ def do_epoch(
     new_weights, new_biases = params
 
     return new_weights, new_biases, opt_state
+
+
+@eqx.filter_jit
+def do_single_batch_update(
+    key: Key[Array, ""],
+    model: AbstractIsingEBMwithGraph,
+    training_spec: BinomialIsingTrainingSpec,
+    bias_nodes: list[AbstractNode],
+    weight_edges: list[Edge],
+    batch_size: int,
+    data_positive: tuple[Array, ...],
+    data_negative: tuple[Array, ...],
+    beta: Array,
+    optim: optax.GradientTransformation,
+    opt_state: optax.OptState,
+    weight_decay: Optional[FloatScalarLike] = None,
+    bias_decay: Optional[FloatScalarLike] = None,
+    correlation_penalty: Optional[FloatScalarLike] = None,
+):
+    """
+    Performs a single batch update without internal batching or shuffling.
+    
+    This is used for iterator-based training where data arrives pre-batched.
+    Unlike do_epoch, this function doesn't shuffle or re-batch the data.
+    
+    Args:
+        key: JAX random key for the batch.
+        model: Initial Ising EBM model.
+        training_spec: Training specification.
+        bias_nodes: Nodes for bias updates.
+        weight_edges: Edges for weight updates.
+        batch_size: Number of examples in the batch.
+        data_positive: Positive phase data tuple (already batched).
+        data_negative: Negative phase data tuple (already batched).
+        beta: Inverse temperature.
+        optim: Optimizer.
+        opt_state: Initial optimizer state.
+        weight_decay: Optional weight decay coefficient.
+        bias_decay: Optional bias decay coefficient.
+        correlation_penalty: Optional correlation penalty.
+
+    Returns:
+        Updated weights, biases, and optimizer state.
+    """
+
+    weight_decay = 0.0 if weight_decay is None else weight_decay
+    bias_decay = 0.0 if bias_decay is None else bias_decay
+
+    key_train, key_init_pos, key_init_neg = jax.random.split(key, 3)
+
+    # Initialize free variables
+    vals_free_pos = hinton_init_from_graph(
+        key_init_pos,
+        model,
+        training_spec.program_positive.gibbs_spec.free_blocks,
+        batch_size,
+        beta,
+    )
+    vals_free_neg = hinton_init_from_graph(
+        key_init_neg,
+        model,
+        training_spec.program_negative.gibbs_spec.free_blocks,
+        batch_size,
+        beta,
+    )
+
+    # Convert tuples to lists to match expected format
+    data_pos_list = list(data_positive)
+    data_neg_list = list(data_negative) if len(data_negative) > 0 else []
+
+    # Compute gradients
+    grad_w, grad_b = symmetric_kl_grad(
+        key_train,
+        model,
+        training_spec,
+        bias_nodes,
+        weight_edges,
+        vals_free_pos,
+        data_pos_list,  # Pass as list
+        vals_free_neg,
+        data_neg_list,  # Pass as list
+        beta,
+        correlation_penalty,
+    )
+
+    # Apply updates with decay
+    params = (model.weights, model.biases)
+    grads = (grad_w, grad_b)
+    updates_without_decays, new_opt_state = optim.update(grads, opt_state, params)
+    weight_updates_without_decay, bias_updates_without_decay = updates_without_decays
+    weight_updates = weight_updates_without_decay - model.weights * weight_decay
+    bias_updates = bias_updates_without_decay - model.biases * bias_decay
+    masked_updates = (weight_updates, bias_updates)
+    new_weights, new_biases = eqx.apply_updates(params, masked_updates)
+
+    return new_weights, new_biases, new_opt_state

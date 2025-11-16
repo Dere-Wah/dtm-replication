@@ -275,6 +275,61 @@ class DiffusionStep(eqx.Module):
 
         return new_weights, new_biases, new_opt_state
     
+    def train_step_model_single_batch(
+        self,
+        key,
+        image_batch: Array,
+        label_batch: Array,
+        correlation_penalty: Optional[FloatScalarLike],
+        weight_decay: Optional[FloatScalarLike],
+        bias_decay: Optional[FloatScalarLike] = None,
+    ):
+        """Trains the diffusion step on a single batch of data (for iterator-based training).
+
+        Similar to train_step_model but operates on a single batch instead of the full dataset.
+        This enables streaming data from iterators without loading everything into memory.
+
+        **Arguments:**
+        - `key`: PRNG key for randomness in initialization and sampling.
+        - `image_batch`: Single batch of image pixels, shape (batch_size, n_image_pixels).
+        - `label_batch`: Single batch of labels, shape (batch_size, n_label_nodes).
+        - `correlation_penalty`: Optional coefficient for correlation regularization.
+        - `weight_decay`: Optional coefficient for weight decay regularization.
+        - `bias_decay`: Optional coefficient for bias decay (defaults to None).
+
+        **Returns:**
+        - Tuple of updated weights, biases, and optimizer state.
+        """
+        key_init, key_train = jr.split(key, 2)
+        batch_size = image_batch.shape[0]
+        assert image_batch.shape == (batch_size, self.n_image_pixels), f"Expected shape {(batch_size, self.n_image_pixels)}, got {image_batch.shape}"
+        assert label_batch.shape == (batch_size, self.n_label_nodes), f"Expected shape {(batch_size, self.n_label_nodes)}, got {label_batch.shape}"
+
+        # Apply perturbations to the batch
+        data_pos, data_neg = self._make_training_data(key_init, image_batch, label_batch)
+
+        # Train on this batch without internal batching (batch_size = batch_size means 1 batch)
+        from thrmlDenoising.ising_training import do_single_batch_update
+        
+        new_weights, new_biases, new_opt_state = do_single_batch_update(
+            key_train,
+            self.model,
+            self.training_spec,
+            self.model.graph.output_nodes + self.model.graph.hidden_nodes,
+            self.model.graph.base_graph_edges,
+            batch_size,
+            data_pos,
+            data_neg,
+            self.training_spec.beta,
+            self.optim,
+            self.opt_state,
+            weight_decay,
+            bias_decay,
+            correlation_penalty,
+        )
+
+        return new_weights, new_biases, new_opt_state
+    
     def denoise(
         self,
         key: PRNGKeyArray,

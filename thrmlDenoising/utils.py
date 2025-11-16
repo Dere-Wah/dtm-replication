@@ -76,6 +76,44 @@ def one_hot(x, digits, num_label_spots, dtype=jnp.int32):
     one_hot_repeated = jnp.concatenate([one_hot] * num_label_spots, axis=-1)
     return jnp.array(one_hot_repeated, dtype=jnp.bool)
 
+def create_dummy_dataset_for_iterator(
+    n_image_pixels: int,
+    n_grayscale_levels: int,
+    n_dummy_samples: int = 10,
+) -> tuple[dict, dict, Array]:
+    """Create a minimal dummy dataset for iterator-based training.
+    
+    This is used when training from an iterator where the actual data comes on-the-fly.
+    The dummy dataset is only used for initialization and to determine dimensions.
+    
+    Args:
+        n_image_pixels: Number of pixels per image
+        n_grayscale_levels: Number of grayscale levels
+        n_dummy_samples: Number of dummy samples to create (small number for initialization)
+    
+    Returns:
+        Tuple of (train_data, test_data, one_hot_labels) compatible with DTM initialization
+    """
+    # For unconditioned generation, we use a minimal label size of 1
+    n_label_nodes = 1
+    
+    # Create dummy data with correct shapes
+    if n_grayscale_levels == 1:
+        dummy_images = jnp.zeros((n_dummy_samples, n_image_pixels), dtype=jnp.bool_)
+    else:
+        dummy_images = jnp.zeros((n_dummy_samples, n_image_pixels), dtype=jnp.int32)
+    
+    dummy_labels = jnp.zeros((n_dummy_samples, n_label_nodes), dtype=jnp.bool_)
+    
+    train_data = {"image": dummy_images, "label": dummy_labels}
+    test_data = {"image": dummy_images[:min(n_dummy_samples, 10)], "label": dummy_labels[:min(n_dummy_samples, 10)]}
+    
+    # Single dummy "class" for unconditioned generation
+    one_hot_labels = jnp.ones((1, n_label_nodes), dtype=jnp.bool_)
+    
+    return train_data, test_data, one_hot_labels
+
+
 def load_dataset(
     dataset_name: str,
     n_grayscale_levels: int,
@@ -192,10 +230,27 @@ def write(text: str, log_path: Optional[str] = None):
             log.write(text)
     print(text, end="", flush=True)
 
-def draw_single_image(image, ax, image_side_len):
-    assert image.shape == (image_side_len * image_side_len,)
-    image = image.reshape(image_side_len, image_side_len)
-    ax.imshow(image, cmap="gray")
+def draw_single_image(image, ax, image_side_len, is_rgb=False):
+    """Draw a single image on an axis.
+    
+    Args:
+        image: Flattened image array
+        ax: Matplotlib axis
+        image_side_len: Side length of square image
+        is_rgb: If True, treats as RGB image (side_len, side_len, 3)
+    """
+    if is_rgb:
+        # RGB image: pixels = side_len * side_len * 3
+        assert image.shape == (image_side_len * image_side_len * 3,), \
+            f"RGB image shape {image.shape} != ({image_side_len * image_side_len * 3},)"
+        image = image.reshape(image_side_len, image_side_len, 3)
+        ax.imshow(image)
+    else:
+        # Grayscale image: pixels = side_len * side_len
+        assert image.shape == (image_side_len * image_side_len,), \
+            f"Grayscale image shape {image.shape} != ({image_side_len * image_side_len},)"
+        image = image.reshape(image_side_len, image_side_len)
+        ax.imshow(image, cmap="gray")
     ax.axis("off")
 
 def draw_image_batch(
@@ -205,11 +260,22 @@ def draw_image_batch(
     super_columns: Optional[int] = None,
     title: Optional[str] = None,
     image_side_len: int = 28,
+    is_rgb: bool = False,
 ):
-    assert images.shape == (
-        h * w,
-        (image_side_len**2),
-    ), f"{images.shape} != ({h} * {w}, {image_side_len}**2)"
+    """Draw a batch of images in a grid.
+    
+    Args:
+        images: Array of flattened images, shape (h*w, n_pixels)
+        h: Number of rows
+        w: Number of columns
+        super_columns: Optional grouping of columns
+        title: Optional title for the figure
+        image_side_len: Side length of square images
+        is_rgb: If True, treats as RGB images (adds factor of 3 to pixel count)
+    """
+    expected_pixels = (image_side_len**2) * (3 if is_rgb else 1)
+    assert images.shape == (h * w, expected_pixels), \
+        f"{images.shape} != ({h} * {w}, {expected_pixels})"
     if super_columns is None:
         super_columns = 1
     assert h % super_columns == 0, f"{h} % {super_columns} != 0"
@@ -217,13 +283,22 @@ def draw_image_batch(
     cols = w * super_columns
 
     fig, axs = plt.subplots(rows, cols, figsize=(2 * cols, 2 * rows))
+    
+    # Handle case where axs is 1D (single row or column)
+    if rows == 1 and cols == 1:
+        axs = np.array([[axs]])  # Make it 2D
+    elif rows == 1:
+        axs = axs.reshape(1, -1)  # Single row
+    elif cols == 1:
+        axs = axs.reshape(-1, 1)  # Single column
+    
     for i in range(h * w):
         y = i // w
         x = i % w
         super_col = y // rows
         row = y % rows
         col = x + super_col * w
-        draw_single_image(images[i], axs[row, col], image_side_len)
+        draw_single_image(images[i], axs[row, col], image_side_len, is_rgb=is_rgb)
 
     if title is not None:
         fig.suptitle(title)

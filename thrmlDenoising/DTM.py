@@ -90,7 +90,7 @@ class DTM:
 
     is_smoke_test: bool
 
-    def __init__(self, cfg: Optional[DTMConfig] = None):
+    def __init__(self, cfg: Optional[DTMConfig] = None, use_dummy_dataset: bool = False, n_image_pixels: Optional[int] = None):
         """Initializes the DTM with configuration, dataset loading, and step setup.
 
         Loads dataset, selects base graph manager based on config, computes diffusion
@@ -99,6 +99,8 @@ class DTM:
 
         **Arguments:**
         - `cfg`: Optional DTMConfig instance; defaults to values in DTM_config if None.
+        - `use_dummy_dataset`: If True, uses a minimal dummy dataset for iterator-based training.
+        - `n_image_pixels`: Required if use_dummy_dataset is True; specifies the number of pixels per image.
         """
         if cfg is None:
             cfg = DTMConfig()
@@ -109,13 +111,24 @@ class DTM:
 
         self.is_smoke_test = "smoke_testing" in cfg.data.dataset_name
 
-        self.train_dataset, self.test_dataset, self.one_hot_target_labels = load_dataset(
-            cfg.data.dataset_name,
-            cfg.graph.grayscale_levels,
-            cfg.data.target_classes,
-            cfg.graph.num_label_spots,
-            cfg.data.pixel_threshold_for_single_trials,
-        )
+        if use_dummy_dataset:
+            # For iterator-based training, create a minimal dummy dataset
+            if n_image_pixels is None:
+                raise ValueError("n_image_pixels must be specified when use_dummy_dataset=True")
+            from thrmlDenoising.utils import create_dummy_dataset_for_iterator
+            self.train_dataset, self.test_dataset, self.one_hot_target_labels = create_dummy_dataset_for_iterator(
+                n_image_pixels,
+                cfg.graph.grayscale_levels,
+                n_dummy_samples=cfg.sampling.batch_size,  # Use batch_size samples for initialization
+            )
+        else:
+            self.train_dataset, self.test_dataset, self.one_hot_target_labels = load_dataset(
+                cfg.data.dataset_name,
+                cfg.graph.grayscale_levels,
+                cfg.data.target_classes,
+                cfg.graph.num_label_spots,
+                cfg.data.pixel_threshold_for_single_trials,
+            )
         
         self.n_image_pixels = self.train_dataset["image"].shape[1]
         self.n_label_nodes = self.train_dataset["label"].shape[1]
@@ -383,6 +396,127 @@ class DTM:
 
         write(f"total training time: {(time.time() - start_training_time):.0f}")
 
+    def train_from_iterator(self, n_epochs, data_iterator_factory, batches_per_epoch, evaluate_every=0):
+        """Trains the DTM using an iterator for on-the-fly data generation.
+
+        This method enables training on datasets that are generated dynamically (e.g., from
+        simulators) without loading the full dataset into memory. The iterator should yield
+        batches of data.
+
+        **Arguments:**
+        - `n_epochs`: Total number of training epochs.
+        - `data_iterator_factory`: Callable that returns a new iterator for each epoch.
+          The iterator should yield tuples of (image_batch,) where image_batch has
+          shape (batch_size, n_image_pixels).
+        - `batches_per_epoch`: Number of batches to process per epoch.
+        - `evaluate_every`: Interval (in epochs) for evaluation and saving (0 to disable).
+        """
+        start_training_time = time.time()
+
+        cp_coeffs = extend_params_or_zeros(self.cfg.cp.correlation_penalty, len(self.steps))
+        wd_coeffs = extend_params_or_zeros(self.cfg.wd.weight_decay, len(self.steps))
+
+        # Create dummy label generator for unconditioned training
+        from thrmlDenoising.iterator_dataloader import DummyLabelGenerator
+        label_gen = DummyLabelGenerator(self.n_label_nodes)
+
+        if evaluate_every:
+            descriptor = f"{self.cfg.exp.descriptor}_{self.cfg.diffusion_schedule.num_diffusion_steps}_step_{self.cfg.graph.graph_preset_architecture}_grid_iterator"
+            if self.cfg.cp.adaptive_cp:
+                descriptor += "_with_adaptive_cp"
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.logging_and_saving_dir = os.path.join(
+                "model_logging_and_saving/", f"{descriptor}_{timestamp}"
+            )
+            os.makedirs(self.logging_and_saving_dir, exist_ok=False)
+            self.log_file = os.path.join(self.logging_and_saving_dir, f"training_log_{descriptor}.txt")
+            # write all of cfg to logging file
+            config_str = pprint.pformat(asdict(self.cfg), indent=2)
+            write("Configuration:\n" + config_str + "\n", self.log_file)
+
+        devices = jax.devices("gpu")
+        n_devices = len(devices)
+
+        def train_one_step_batch(step, key, image_batch, label_batch, cp_coeff, wd_coeff):
+            return step.train_step_model_single_batch(
+                key, image_batch, label_batch, cp_coeff, wd_coeff, None
+            )
+
+        # these jitted training functions should only trace once per step
+        train_fns = [
+            eqx.filter_jit(fun=train_one_step_batch, device=devices[i % n_devices])
+            for i in range(len(self.steps))
+        ]
+
+        def thread_worker(i, step, key, image_batch, label_batch, cp_coeff, wd_coeff):
+            return train_fns[i](step, key, image_batch, label_batch, cp_coeff, wd_coeff)
+
+        # Note: We skip initial autocorr computation for iterator-based training
+        # since we don't have a test dataset loaded
+        if evaluate_every:
+            write(f"Starting iterator-based training for {n_epochs} epochs with {batches_per_epoch} batches per epoch\n", self.log_file)
+
+        for epoch in range(1, n_epochs + 1):
+            epoch_training_start_time = time.time()
+            
+            # Create a new iterator for this epoch
+            data_iterator = data_iterator_factory()
+            
+            batch_count = 0
+            for batch_data in data_iterator:
+                if batch_count >= batches_per_epoch:
+                    break
+                
+                # Unpack batch (should be tuple of (images,))
+                image_batch = batch_data[0]
+                batch_size = image_batch.shape[0]
+                
+                # Generate dummy labels
+                label_batch = label_gen.get_labels(batch_size)
+                
+                # Train all steps on this batch in parallel
+                keys = jr.split(self._get_new_key(), len(self.steps))
+                
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [
+                        executor.submit(
+                            thread_worker, i, self.steps[i], keys[i], image_batch, label_batch, cp_coeffs[i], wd_coeffs[i]
+                        )
+                        for i in range(len(self.steps))
+                    ]
+                    results = [f.result() for f in futures]
+
+                # Update steps with new parameters
+                for i, result in enumerate(results):
+                    new_step_weights, new_step_biases, new_opt_state = result
+                    old = self.steps[i]
+
+                    new_pos_per_block_interact_train = get_new_per_block_interactions(old.training_spec.program_positive, new_step_weights, new_step_biases)
+                    new_neg_per_block_interact_train = get_new_per_block_interactions(old.training_spec.program_negative, new_step_weights, new_step_biases)
+                    new_free_per_block_interact_gen = get_new_per_block_interactions(old.generation_spec.program_free, new_step_weights, new_step_biases)
+                    new_cond_per_block_interact_gen = get_new_per_block_interactions(old.generation_spec.program_conditioned, new_step_weights, new_step_biases)
+
+                    self.steps[i] = eqx.tree_at(
+                        lambda s: (s.model.weights, s.model.biases, s.opt_state, s.training_spec.program_positive.per_block_interactions, s.training_spec.program_negative.per_block_interactions, s.generation_spec.program_free.per_block_interactions, s.generation_spec.program_conditioned.per_block_interactions),
+                        old, (new_step_weights, new_step_biases, new_opt_state, new_pos_per_block_interact_train, new_neg_per_block_interact_train, new_free_per_block_interact_gen, new_cond_per_block_interact_gen)
+                    )
+                
+                batch_count += 1
+            
+            epoch_time = time.time() - epoch_training_start_time
+            write(f"Epoch {epoch}: processed {batch_count} batches in {epoch_time:.1f}s ({epoch_time/batch_count:.2f}s per batch)\n", self.log_file)
+
+            # Adaptive regularization would require a test dataset, skipping for iterator training
+            # Users can implement custom logic if they have a test set
+
+            if evaluate_every and epoch % evaluate_every == 0:
+                eval_start_time = time.time()
+                self.eval_epoch(epoch)
+                write(f"Time to evaluate epoch {epoch}: {(time.time() - eval_start_time):.1f}\n", self.log_file)
+
+        write(f"total training time: {(time.time() - start_training_time):.0f}\n", self.log_file)
+
     def _run_denoising(self, key, free: bool, batch_size: int, schedule: SamplingSchedule):
         """Runs the full reverse diffusion chain to generate samples.
 
@@ -560,11 +694,20 @@ class DTM:
         )
         to_draw = jnp.clip(to_draw, 0, 1)
 
+        # Detect if RGB (3 channels) or grayscale
+        is_rgb = (image_size % 3 == 0) and (int(jnp.sqrt(image_size / 3))**2 * 3 == image_size)
+        if is_rgb:
+            image_side_len = int(jnp.sqrt(image_size / 3))
+        else:
+            image_side_len = int(jnp.sqrt(image_size))
+
         fig = draw_image_batch(
             to_draw,
             self.one_hot_target_labels.shape[0] * len(self.steps),
             drawn_images_per_digit,
             super_columns=2 if self.one_hot_target_labels.shape[0] > 4 else 1,
+            image_side_len=image_side_len,
+            is_rgb=is_rgb,
         )
         desc_str = "free" if free else "clamped"
         fig.savefig(f"{filename}_{desc_str}.png")
@@ -575,7 +718,13 @@ class DTM:
         data_name = f"{image_mode}_{self.cfg.data.dataset_name}"
         script_dir = os.path.dirname(os.path.abspath(__file__))
         fid_precomputed_stats_path = os.path.join(script_dir, 'fid', 'precomputed_stats', f"{data_name}_train.npz")
-        fid, _, _ = bootstrap_fid_fn(images_for_fid, fid_precomputed_stats_path)
+        
+        # Check if FID stats exist (they won't for iterator-based datasets)
+        if os.path.exists(fid_precomputed_stats_path):
+            fid, _, _ = bootstrap_fid_fn(images_for_fid, fid_precomputed_stats_path)
+        else:
+            write(f"Note: FID precomputed stats not found at {fid_precomputed_stats_path}, skipping FID computation\n", self.log_file if hasattr(self, 'log_file') else None)
+            fid = -1.0  # Sentinel value indicating FID not computed
         return fid
     
     def generate_gif(
@@ -775,16 +924,17 @@ class DTM:
         ys_clamp = np.array(self.fids_dict.get("clamped", []), dtype=float)
 
         def inv(arr):
+            # Ignore negative values (FID not computed sentinel)
             return np.where(arr > 0.0, 1.0 / arr, np.nan)
 
         plt.figure()
-        if ys_free.size:
+        if ys_free.size and np.any(ys_free > 0):
             plt.plot(xs, inv(ys_free), marker="o", label="free")
-        if ys_clamp.size:
+        if ys_clamp.size and np.any(ys_clamp > 0):
             plt.plot(xs, inv(ys_clamp), marker="o", label="clamped")
         plt.xlabel("Epoch")
         plt.ylabel("1 / FID")
-        plt.title("1/FID vs Epoch")
+        plt.title("1/FID vs Epoch (FID not available for iterator datasets)")
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
@@ -812,8 +962,13 @@ class DTM:
             self._get_new_key(), fig_filename, free=True
         )
         self.fids_dict["free"].append(fid_free)
-        best_free_fid = min(self.fids_dict["free"])
-        fid_str = f"Epoch {epoch} free FID: {fid_free:.2f} (best: {best_free_fid:.2f}) "
+        
+        # Build FID string (handle case where FID is not computed)
+        if fid_free >= 0:
+            best_free_fid = min([f for f in self.fids_dict["free"] if f >= 0])
+            fid_str = f"Epoch {epoch} free FID: {fid_free:.2f} (best: {best_free_fid:.2f}) "
+        else:
+            fid_str = f"Epoch {epoch} (FID not computed) "
 
         if self.cfg.exp.generate_gif:
             self.generate_gif(epoch, self.cfg.exp.animated_images_per_digit, self.cfg.exp.steps_per_sample_in_gif)
@@ -822,8 +977,12 @@ class DTM:
             self._get_new_key(), fig_filename, free=False
         )
         self.fids_dict["clamped"].append(fid_clamped)
-        best_clamped_fid = min(self.fids_dict["clamped"])
-        fid_str += f"clamped FID: {fid_clamped:.2f} (best: {best_clamped_fid:.2f})" + "\n"
+        
+        if fid_clamped >= 0:
+            best_clamped_fid = min([f for f in self.fids_dict["clamped"] if f >= 0])
+            fid_str += f"clamped FID: {fid_clamped:.2f} (best: {best_clamped_fid:.2f})" + "\n"
+        else:
+            fid_str += "(FID not computed)\n"
         write(fid_str, self.log_file)
 
         self.eval_epochs.append(epoch)
