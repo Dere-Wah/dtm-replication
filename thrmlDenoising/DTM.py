@@ -775,8 +775,14 @@ class DTM:
         n_samples = self.steps[0].generation_spec.schedule.n_warmup // steps_per_sample #run for a total time of warmup in generation spec
         schedule = SamplingSchedule(0, n_samples, steps_per_sample)
 
-        side = int(round(np.sqrt(self.n_image_pixels)))
-        assert side * side == self.n_image_pixels, "self.n_image_pixels must be a perfect square for gif generation."
+        # Detect if RGB (3 channels) or grayscale
+        is_rgb = (self.n_image_pixels % 3 == 0) and (int(np.sqrt(self.n_image_pixels / 3))**2 * 3 == self.n_image_pixels)
+        if is_rgb:
+            side = int(round(np.sqrt(self.n_image_pixels / 3)))
+            assert side * side * 3 == self.n_image_pixels, f"RGB image pixels must be side²×3: {side}²×3={side*side*3} != {self.n_image_pixels}"
+        else:
+            side = int(round(np.sqrt(self.n_image_pixels)))
+            assert side * side == self.n_image_pixels, "Grayscale image pixels must be a perfect square for gif generation."
 
         # Run denoising with per-sample retention for GIF frames
         # image_readout_list: list over steps, each of shape (n_labels, batch_size, num_samples, image_block_len)
@@ -802,6 +808,7 @@ class DTM:
                 label_readout_list=label_readout_list,
                 enable_label_bars=True,
                 steps_per_sample=steps_per_sample,
+                is_rgb=is_rgb,
             )
 
         write(f"Time to generate gifs: {time.time() - start_gif_time:.1f}s\n")

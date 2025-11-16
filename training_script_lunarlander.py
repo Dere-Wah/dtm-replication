@@ -104,7 +104,7 @@ exp_params = {
     "descriptor": "lunarlander_rgb",
     "n_cores": 1,
     "compute_autocorr": False,  # Disabled for iterator training (requires test dataset)
-    "generate_gif": False,  # Can be enabled after training stabilizes
+    "generate_gif": True,  # Now supports RGB GIF generation!
     "drawn_images_per_digit": 4,
     "animated_images_per_digit": 2,
     "steps_per_sample_in_gif": 10,

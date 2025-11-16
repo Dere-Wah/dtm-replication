@@ -319,6 +319,7 @@ def denoise_arrays_to_gif(
     label_readout_list: list[np.ndarray] | None = None,   # list over steps; each (n_labels, rp_avail, n_samples, label_size)
     enable_label_bars: bool = False,
     steps_per_sample: int = 1,
+    is_rgb: bool = False,
 ):
     """
     Rows = steps (noisiest -> least noisy). Columns = images ordered by label-major
@@ -348,7 +349,14 @@ def denoise_arrays_to_gif(
     n_steps = len(image_readout_list)
     n_labels, rp_avail, n_samples, image_size = image_readout_list[0].shape
     assert rp_avail >= runs_per_label, "runs_per_label exceeds available runs"
-    assert image_side_len * image_side_len == image_size, "image_size must be a perfect square"
+    
+    # Check image size matches expected dimensions (handle both RGB and grayscale)
+    if is_rgb:
+        expected_size = image_side_len * image_side_len * 3
+        assert image_size == expected_size, f"RGB image_size {image_size} != {image_side_len}²×3 = {expected_size}"
+    else:
+        expected_size = image_side_len * image_side_len
+        assert image_size == expected_size, f"Grayscale image_size {image_size} != {image_side_len}² = {expected_size}"
 
     use_bars = enable_label_bars and (label_readout_list is not None)
     if use_bars:
@@ -480,7 +488,13 @@ def denoise_arrays_to_gif(
 
     def _img_tile(step_arr: np.ndarray, lbl_idx: int, run_idx: int, s: int) -> np.ndarray:
         flat = step_arr[lbl_idx, run_idx, s, :]  # (image_size,)
-        tile = _norm_img(flat).reshape(image_side_len, image_side_len)
+        normalized = _norm_img(flat)
+        if is_rgb:
+            # RGB: reshape to (side, side, 3)
+            tile = normalized.reshape(image_side_len, image_side_len, 3)
+        else:
+            # Grayscale: reshape to (side, side)
+            tile = normalized.reshape(image_side_len, image_side_len)
         return tile
 
     def _bars_tile(label_step_arr: np.ndarray, lbl_idx: int, run_idx: int, s: int) -> np.ndarray:
@@ -534,7 +548,10 @@ def denoise_arrays_to_gif(
         # animate each step k
         for k in range(n_steps):
             for s in range(0, n_samples, stride):
-                frame = np.zeros((frame_h, frame_w), dtype=np.float32)
+                if is_rgb:
+                    frame = np.zeros((frame_h, frame_w, 3), dtype=np.float32)
+                else:
+                    frame = np.zeros((frame_h, frame_w), dtype=np.float32)
 
                 # draw each row r
                 for r in range(n_steps):
@@ -549,10 +566,18 @@ def denoise_arrays_to_gif(
                         cur_steps = 0
                     txt = f"{cur_steps}/{total_steps}" 
                     bmp = _render_counter_bitmap(txt, image_side_len)
-                    frame[y0:y0 + image_side_len, 0:bmp.shape[1]] = np.maximum(
-                        frame[y0:y0 + image_side_len, 0:bmp.shape[1]],
-                        bmp
-                    )
+                    if is_rgb:
+                        # Broadcast counter to all RGB channels
+                        for c in range(3):
+                            frame[y0:y0 + image_side_len, 0:bmp.shape[1], c] = np.maximum(
+                                frame[y0:y0 + image_side_len, 0:bmp.shape[1], c],
+                                bmp
+                            )
+                    else:
+                        frame[y0:y0 + image_side_len, 0:bmp.shape[1]] = np.maximum(
+                            frame[y0:y0 + image_side_len, 0:bmp.shape[1]],
+                            bmp
+                        )
 
                     # --- 2) columns (images + bars) ---
                     for col in range(n_cols):
@@ -567,9 +592,16 @@ def denoise_arrays_to_gif(
                             if use_bars:
                                 bars = final_rows_bars[r][col]
                                 xb = x0 + image_side_len + spacer_img_to_bars
-                                frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
-                                    frame[y0:y0 + image_side_len, xb:xb + n_labels], bars
-                                )
+                                if is_rgb:
+                                    # Bars are grayscale, broadcast to RGB channels
+                                    for c in range(3):
+                                        frame[y0:y0 + image_side_len, xb:xb + n_labels, c] = np.maximum(
+                                            frame[y0:y0 + image_side_len, xb:xb + n_labels, c], bars
+                                        )
+                                else:
+                                    frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
+                                        frame[y0:y0 + image_side_len, xb:xb + n_labels], bars
+                                    )
                         elif r == k:
                             # current evolving sample
                             img_tile = _img_tile(image_readout_list[r], lbl_idx, run_idx, s)
@@ -577,34 +609,59 @@ def denoise_arrays_to_gif(
                             if use_bars:
                                 bars = _bars_tile(label_readout_list[r], lbl_idx, run_idx, s)
                                 xb = x0 + image_side_len + spacer_img_to_bars
-                                frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
-                                    frame[y0:y0 + image_side_len, xb:xb + n_labels], bars
-                                )
+                                if is_rgb:
+                                    # Bars are grayscale, broadcast to RGB channels
+                                    for c in range(3):
+                                        frame[y0:y0 + image_side_len, xb:xb + n_labels, c] = np.maximum(
+                                            frame[y0:y0 + image_side_len, xb:xb + n_labels, c], bars
+                                        )
+                                else:
+                                    frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
+                                        frame[y0:y0 + image_side_len, xb:xb + n_labels], bars
+                                    )
                         else:
                             # not started: black image; bars baseline only if enabled
                             if use_bars:
                                 # draw baseline bars (just bottom white row)
                                 xb = x0 + image_side_len + spacer_img_to_bars
-                                frame[y0 + image_side_len - 1, xb:xb + n_labels] = 1.0
+                                if is_rgb:
+                                    frame[y0 + image_side_len - 1, xb:xb + n_labels, :] = 1.0
+                                else:
+                                    frame[y0 + image_side_len - 1, xb:xb + n_labels] = 1.0
                             # image area remains black
 
                 writer.append_data((np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8))
 
         # final frame (everything frozen complete)
-        frame = np.zeros((frame_h, frame_w), dtype=np.float32)
+        if is_rgb:
+            frame = np.zeros((frame_h, frame_w, 3), dtype=np.float32)
+        else:
+            frame = np.zeros((frame_h, frame_w), dtype=np.float32)
         for r in range(n_steps):
             y0 = r * (image_side_len + pad)
             # counter at N/N
             bmp = _render_counter_bitmap(f"{total_steps}/{total_steps}", image_side_len)
-            frame[y0:y0 + image_side_len, 0:bmp.shape[1]] = np.maximum(
-                frame[y0:y0 + image_side_len, 0:bmp.shape[1]], bmp
-            )
+            if is_rgb:
+                for c in range(3):
+                    frame[y0:y0 + image_side_len, 0:bmp.shape[1], c] = np.maximum(
+                        frame[y0:y0 + image_side_len, 0:bmp.shape[1], c], bmp
+                    )
+            else:
+                frame[y0:y0 + image_side_len, 0:bmp.shape[1]] = np.maximum(
+                    frame[y0:y0 + image_side_len, 0:bmp.shape[1]], bmp
+                )
             for col in range(n_cols):
                 x0 = left_w + col * tile_w
                 frame[y0:y0 + image_side_len, x0:x0 + image_side_len] = final_rows_images[r][col]
                 if use_bars:
                     xb = x0 + image_side_len + spacer_img_to_bars
-                    frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
-                        frame[y0:y0 + image_side_len, xb:xb + n_labels], final_rows_bars[r][col]
-                    )
+                    if is_rgb:
+                        for c in range(3):
+                            frame[y0:y0 + image_side_len, xb:xb + n_labels, c] = np.maximum(
+                                frame[y0:y0 + image_side_len, xb:xb + n_labels, c], final_rows_bars[r][col]
+                            )
+                    else:
+                        frame[y0:y0 + image_side_len, xb:xb + n_labels] = np.maximum(
+                            frame[y0:y0 + image_side_len, xb:xb + n_labels], final_rows_bars[r][col]
+                        )
         writer.append_data((np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8))
