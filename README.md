@@ -5,6 +5,16 @@ We believe the DTM design space—and even generally the architectures for conne
 
 ---
 
+## Model overview
+
+A DTM instantiates a reverse-diffusion chain where each interval is parameterized by an independent Ising energy-based model (`DiffusionStep`). During initialization the code builds a linear or logarithmic time grid, seeds a graph for every step, and equips it with matched training and generation schedules so that every block-Gibbs sampler approximates \(p(x_{t-\Delta t}\mid x_t)\) for its portion of the chain. Steps can vary in learning-rate, optimizer state, and random graph seed, but they share the dataset interface and diffusion rates supplied through `DTMConfig`.
+
+Graph construction is delegated to interchangeable base-graph managers (Poisson-binomial by default) that expand each pixel into deterministic bundles of Ising trials, pack label/conditioning information, and lay those visible nodes onto a bipartite grid together with hidden spin reservoirs. This abstraction lets you swap encodings (e.g., binary representations or spatially convolved layouts), experiment with different degrees/side lengths, and reason about capacity in terms of “visible nodes per step” rather than code changes.
+
+Training runs each step in parallel. For every batch the forward diffusion process perturbs image and label data to the current time interval, producing positive (start) and negative (end) samples that feed a symmetric KL objective implemented with block-Gibbs sampling. Autocorrelation is measured per step to adapt correlation penalties or weight decay coefficients, which stabilizes learning when samplers mix slowly.
+
+Generation starts from noise at the noisiest step and iterates `_run_denoising`, passing the last sample of one step as the input block of the next. The same machinery supports free and conditional sampling, drawing utilities, FID scoring, GIF export, and checkpointing. Because steps are independent, you can splice checkpoints from different runs or train later steps with iterator-fed data without retracing earlier ones.
+
 ## Installation
 
 thrmlDenoising is built on top of JAX, thrml, and other standard python libraries.
