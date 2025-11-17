@@ -24,6 +24,7 @@ def denoise_conditional_arrays_to_gif(
     pad: int = 2,
     steps_per_sample: int = 1,
     is_rgb: bool = False,
+    is_3class: bool = False,  # NEW: 3-class representation (0=black, 1=terrain, 2=lander)
     clean_conditioning_frames: Optional[list] = None,  # List of [frame0, frame1] for each run
     clean_conditioning_actions: Optional[list] = None,  # List of [action0, action1] for each run  
     clean_ground_truth_frames: Optional[list] = None,  # List of frame2 for each run
@@ -47,6 +48,7 @@ def denoise_conditional_arrays_to_gif(
         pad: Padding between images
         steps_per_sample: Gibbs steps between samples
         is_rgb: If True, treats as RGB images
+        is_3class: If True, treats as 3-class images (0=black, 1=terrain, 2=lander)
         clean_conditioning_frames: CLEAN conditioning frames from dataset (not noisy graph representation)
         clean_conditioning_actions: Actions for conditioning frames
         clean_ground_truth_frames: Ground truth target frames
@@ -59,11 +61,21 @@ def denoise_conditional_arrays_to_gif(
     
     # Extract conditioning data dimensions
     condition_size = label_readout_list[0].shape[-1] if label_readout_list else 0
-    n_pixels_per_frame = image_side_len * image_side_len * (3 if is_rgb else 1)
+    
+    # Calculate bits per frame based on representation
+    if is_3class:
+        # 3-class uses 2 bits per pixel
+        n_bits_per_frame = image_side_len * image_side_len * 2
+    elif is_rgb:
+        n_bits_per_frame = image_side_len * image_side_len * 3
+    else:
+        n_bits_per_frame = image_side_len * image_side_len
+    
     n_action_classes = 4  # LunarLander has 4 actions
     
-    # Conditioning data: 2 frames + 2 actions (one-hot encoded)
-    expected_condition_size = 2 * n_pixels_per_frame + 2 * n_action_classes
+    # Conditioning data: 2 frames stacked on channel axis + 2 actions (one-hot encoded)
+    # For 3-class: (H*W*4) stacked frames + 4 + 4 actions = 4096 + 8 = 4104
+    expected_condition_size = 2 * n_bits_per_frame + 2 * n_action_classes
     
     # Simple 3x5 font for action numbers
     FONT_3x5 = {
@@ -114,20 +126,64 @@ def denoise_conditional_arrays_to_gif(
             x += w + gap
         return canvas
     
+    def class_to_rgb(class_img: np.ndarray) -> np.ndarray:
+        """Convert 3-class image to RGB for visualization.
+        
+        Args:
+            class_img: Array with integer class labels 0, 1, or 2
+            
+        Returns:
+            RGB image array with shape (..., 3)
+        """
+        # Create RGB output
+        rgb = np.zeros((*class_img.shape, 3), dtype=np.float32)
+        
+        # Class 0: Black (0, 0, 0)
+        mask0 = (class_img == 0)
+        rgb[mask0] = [0.0, 0.0, 0.0]
+        
+        # Class 1: White/terrain (255, 255, 255) -> normalized to (1.0, 1.0, 1.0)
+        mask1 = (class_img == 1)
+        rgb[mask1] = [1.0, 1.0, 1.0]
+        
+        # Class 2: Purple lander (128, 102, 230) -> normalized to (0.502, 0.400, 0.902)
+        mask2 = (class_img == 2)
+        rgb[mask2] = [128.0/255.0, 102.0/255.0, 230.0/255.0]
+        
+        return rgb
+    
     def norm_img(x: np.ndarray) -> np.ndarray:
         return np.clip(np.asarray(x, dtype=np.float32) / float(n_grayscale_levels), 0.0, 1.0)
     
     def extract_conditioning_frames_and_actions(condition_data: np.ndarray):
-        """Extract 2 frames and 2 actions from conditioning data."""
-        # condition_data shape: (condition_size,) = 6152
-        # First 2 frames: indices 0:6144 (2 * 3072)
-        # Actions: indices 6144:6152 (2 * 4)
+        """Extract 2 frames and 2 actions from conditioning data.
         
-        frame0 = condition_data[:n_pixels_per_frame]
-        frame1 = condition_data[n_pixels_per_frame:2*n_pixels_per_frame]
+        Note: Frames are stacked on channel axis for local attention.
+        For 3-class: condition_data has shape (4104,) = 4096 stacked frames + 8 actions
+        """
+        # Stacked frames: first (2 * n_bits_per_frame) elements
+        stacked_frames_size = 2 * n_bits_per_frame
+        stacked_frames_flat = condition_data[:stacked_frames_size]
         
-        action0_onehot = condition_data[2*n_pixels_per_frame:2*n_pixels_per_frame + n_action_classes]
-        action1_onehot = condition_data[2*n_pixels_per_frame + n_action_classes:2*n_pixels_per_frame + 2*n_action_classes]
+        # Reshape stacked frames: (H*W*4,) → (H, W, 4)
+        if is_3class:
+            stacked_frames = stacked_frames_flat.reshape(image_side_len, image_side_len, 4)
+            # Split into frame0 (channels 0-1) and frame1 (channels 2-3)
+            frame0 = stacked_frames[:, :, 0:2].reshape(-1)  # (H*W*2,)
+            frame1 = stacked_frames[:, :, 2:4].reshape(-1)  # (H*W*2,)
+        elif is_rgb:
+            stacked_frames = stacked_frames_flat.reshape(image_side_len, image_side_len, 6)
+            frame0 = stacked_frames[:, :, 0:3].reshape(-1)  # (H*W*3,)
+            frame1 = stacked_frames[:, :, 3:6].reshape(-1)  # (H*W*3,)
+        else:
+            # Grayscale stacked
+            stacked_frames = stacked_frames_flat.reshape(image_side_len, image_side_len, 2)
+            frame0 = stacked_frames[:, :, 0].reshape(-1)
+            frame1 = stacked_frames[:, :, 1].reshape(-1)
+        
+        # Actions come after stacked frames
+        action0_onehot = condition_data[stacked_frames_size:stacked_frames_size + n_action_classes]
+        action1_onehot = condition_data[stacked_frames_size + n_action_classes:stacked_frames_size + 2*n_action_classes]
         
         # Convert one-hot to integer
         action0 = int(np.argmax(action0_onehot)) if action0_onehot.sum() > 0 else 0
@@ -137,10 +193,25 @@ def denoise_conditional_arrays_to_gif(
     
     def frame_to_image(frame_data: np.ndarray) -> np.ndarray:
         """Convert flat frame data to HxWxC image."""
-        normalized = norm_img(frame_data)
-        if is_rgb:
+        if is_3class:
+            # For 3-class data with n_grayscale_levels=2, data is 2-bit encoded
+            # Each pixel uses 2 bits: [high_bit, low_bit]
+            # Decode: class = high_bit*2 + low_bit
+            # Class 0 → [0, 0], Class 1 → [0, 1], Class 2 → [1, 0]
+            
+            # Reshape from flat array to 2-bit pairs
+            frame_2bit = frame_data.reshape(image_side_len, image_side_len, 2)
+            
+            # Convert 2-bit to class labels (0, 1, 2)
+            class_img = frame_2bit[..., 0].astype(np.int32) * 2 + frame_2bit[..., 1].astype(np.int32)
+            
+            # Convert class labels to RGB for visualization
+            img = class_to_rgb(class_img)
+        elif is_rgb:
+            normalized = norm_img(frame_data)
             img = normalized.reshape(image_side_len, image_side_len, 3)
         else:
+            normalized = norm_img(frame_data)
             img = normalized.reshape(image_side_len, image_side_len)
         return img
     
@@ -199,7 +270,8 @@ def denoise_conditional_arrays_to_gif(
         canvas_height = col_height
         canvas_width = runs_per_label * col_width_total + (runs_per_label - 1) * pad
         
-        if is_rgb:
+        # For 3-class representation, we always use RGB canvas for visualization
+        if is_rgb or is_3class:
             canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.float32)
         else:
             canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
@@ -214,14 +286,14 @@ def denoise_conditional_arrays_to_gif(
                 
                 # Place conditioning frame 0 (top left) - STATIC CLEAN
                 y0, x0 = 0, x_offset
-                if is_rgb:
+                if is_rgb or is_3class:
                     canvas[y0:y0+image_side_len, x0:x0+image_side_len, :] = np.clip(img0, 0, 1)
                 else:
                     canvas[y0:y0+image_side_len, x0:x0+image_side_len] = np.clip(img0.squeeze(), 0, 1)
                 
                 # Place conditioning frame 1 (top right of left section) - STATIC CLEAN
                 x1 = x_offset + image_side_len + pad // 2
-                if is_rgb:
+                if is_rgb or is_3class:
                     canvas[y0:y0+image_side_len, x1:x1+image_side_len, :] = np.clip(img1, 0, 1)
                 else:
                     canvas[y0:y0+image_side_len, x1:x1+image_side_len] = np.clip(img1.squeeze(), 0, 1)
@@ -230,14 +302,14 @@ def denoise_conditional_arrays_to_gif(
                 action_y = image_side_len
                 # Action 0 below frame 0
                 action0_text = render_number(action0, action_text_height, image_side_len)
-                if is_rgb:
+                if is_rgb or is_3class:
                     for c in range(3):
                         canvas[action_y:action_y+action_text_height, x0:x0+image_side_len, c] = action0_text
                 else:
                     canvas[action_y:action_y+action_text_height, x0:x0+image_side_len] = action0_text
                 
                 # Action 1 below frame 1 - STATIC
-                if is_rgb:
+                if is_rgb or is_3class:
                     for c in range(3):
                         canvas[action_y:action_y+action_text_height, x1:x1+image_side_len, c] = render_number(action1, action_text_height, image_side_len)
                 else:
@@ -251,7 +323,7 @@ def denoise_conditional_arrays_to_gif(
             # Place denoising frame (middle section) - ANIMATED PREDICTION
             x_denoise = x_offset + col_width_left + pad
             y_denoise = 0
-            if is_rgb:
+            if is_rgb or is_3class:
                 canvas[y_denoise:y_denoise+image_side_len, x_denoise:x_denoise+image_side_len, :] = denoising_img
             else:
                 canvas[y_denoise:y_denoise+image_side_len, x_denoise:x_denoise+image_side_len] = denoising_img
@@ -260,7 +332,7 @@ def denoise_conditional_arrays_to_gif(
             if run_idx < len(ground_truth_cache):
                 gt_frame, gt_action = ground_truth_cache[run_idx]
                 x_gt = x_denoise + col_width_middle + pad
-                if is_rgb:
+                if is_rgb or is_3class:
                     canvas[y_denoise:y_denoise+image_side_len, x_gt:x_gt+image_side_len, :] = np.clip(gt_frame, 0, 1)
                 else:
                     canvas[y_denoise:y_denoise+image_side_len, x_gt:x_gt+image_side_len] = np.clip(gt_frame.squeeze(), 0, 1)

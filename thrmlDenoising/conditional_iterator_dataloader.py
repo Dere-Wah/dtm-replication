@@ -8,6 +8,51 @@ import numpy as np
 from typing import Iterator, Tuple, Optional
 
 
+def process_frame(frame):
+    """
+    Converts the frame to a single channel with 3 classes:
+    - Class 0: Black pixels (background) - all channels == 0
+    - Class 1: Other pixels (terrain, etc.) - everything else
+    - Class 2: Purple pixels (lunar lander) - #8066E6 = RGB(128, 102, 230)
+    
+    Args:
+        frame: Array of shape (H, W, 3) with RGB values in [0, 255] or [0, 1]
+        
+    Returns:
+        Single-channel array of shape (H, W) with integer class labels 0, 1, or 2
+    """
+    # Normalize to [0, 255] if needed
+    if jnp.max(frame) <= 1.0:
+        frame = frame * 255.0
+    
+    # If input frame has shape (H, W, 3)
+    if frame.shape[-1] == 3:
+        # Black pixels: all channels == 0
+        black_mask = jnp.all(frame == 0, axis=-1)
+        
+        # Purple detection for lunar lander color #8066E6 = RGB(128, 102, 230)
+        # Allow some tolerance for color matching
+        r, g, b = frame[..., 0], frame[..., 1], frame[..., 2]
+        target_r, target_g, target_b = 128, 102, 230
+        tolerance = 30
+        
+        purple_mask = (
+            (jnp.abs(r - target_r) < tolerance) &
+            (jnp.abs(g - target_g) < tolerance) &
+            (jnp.abs(b - target_b) < tolerance)
+        )
+        
+        # Assign classes: 0 for black, 2 for purple, 1 for everything else
+        processed = jnp.ones(frame.shape[:2], dtype=jnp.int32)
+        processed = jnp.where(purple_mask, 2, processed)
+        processed = jnp.where(black_mask, 0, processed)
+    else:
+        # If already single channel, just apply 0: stays 0; any other-->1
+        processed = jnp.where(frame == 0, 0, 1)
+    
+    return processed
+
+
 class ConditionalIteratorDataLoader:
     """Iterator dataloader for conditional DTM training on frame prediction.
     
@@ -54,36 +99,59 @@ class ConditionalIteratorDataLoader:
         self._n_condition_nodes = None
         self._n_target_nodes = None
         
-    def _preprocess_image(self, frame: jnp.ndarray) -> jnp.ndarray:
-        """Preprocess a single frame.
+    def _preprocess_image(self, frame: jnp.ndarray, keep_spatial: bool = False) -> jnp.ndarray:
+        """Preprocess a single frame using 3-class color space.
         
         Args:
-            frame: Array of shape (H, W, C)
+            frame: Array of shape (H, W, C) with RGB values
+            keep_spatial: If True, return (H, W, channels) instead of flattened
             
         Returns:
-            Processed frame as a 1D array
+            Processed frame - format depends on n_grayscale_levels and keep_spatial:
+            - n_grayscale_levels=1: boolean array
+            - n_grayscale_levels=2: boolean array with 2 bits per pixel (for 3 classes)
+            Shape: (H, W, bits) if keep_spatial=True, else (H*W*bits,)
         """
         # Apply custom preprocessing if provided
         if self.image_preprocessing is not None:
             frame = self.image_preprocessing(frame)
         
-        # Normalize to [0, 1] if needed
-        if jnp.max(frame) > 1.0:
-            frame = frame / 255.0
+        # Convert RGB to 3-class representation (0=black, 1=other, 2=purple/lander)
+        frame = process_frame(frame)
         
-        # Quantize to grayscale levels
+        # Quantize based on grayscale levels setting
         if self.n_grayscale_levels == 1:
-            # Binary: threshold at 0.5
-            frame = jnp.asarray(frame > 0.5, dtype=jnp.bool_)
+            # Binary: convert to bool (any non-zero becomes True)
+            frame = jnp.asarray(frame > 0, dtype=jnp.bool_)
+            if keep_spatial:
+                return frame[..., jnp.newaxis]  # Add channel dimension
+            return frame.reshape(-1)
+        elif self.n_grayscale_levels == 2:
+            # 3 classes require 2 bits per pixel
+            # Convert each class to 2-bit binary representation:
+            # Class 0 → [0, 0] = False, False
+            # Class 1 → [0, 1] = False, True  
+            # Class 2 → [1, 0] = True, False
+            H, W = frame.shape
+            # Create output with 2 bits per pixel
+            frame_2bit = jnp.zeros((H, W, 2), dtype=jnp.bool_)
+            
+            # Set bits based on class
+            frame_2bit = frame_2bit.at[:, :, 0].set(frame >= 2)  # High bit: True for class 2
+            frame_2bit = frame_2bit.at[:, :, 1].set((frame == 1) | (frame == 3))  # Low bit: True for class 1 (and 3 if exists)
+            
+            # Return with or without spatial structure
+            if keep_spatial:
+                return frame_2bit  # (H, W, 2)
+            else:
+                # Flatten to 1D: [H*W*2] where every 2 elements represent one pixel
+                return frame_2bit.reshape(-1)
         else:
-            # Multi-level quantization
-            frame = jnp.asarray(
-                jnp.rint(frame * self.n_grayscale_levels),
-                dtype=jnp.int32
-            )
-        
-        # Flatten to 1D
-        return frame.reshape(-1)
+            # For other grayscale levels, keep the 3-class structure
+            frame = jnp.asarray(frame, dtype=jnp.int32)
+            if keep_spatial:
+                return frame[..., jnp.newaxis]
+            return frame.reshape(-1)
     
     def _action_to_onehot(self, action: int) -> jnp.ndarray:
         """Convert action integer to one-hot encoding.
@@ -138,24 +206,36 @@ class ConditionalIteratorDataLoader:
             triplet_frames = frames[start_idx:start_idx + 3]  # (3, H, W, C)
             triplet_actions = expanded_actions[start_idx:start_idx + 3]  # (3,)
             
-            # Preprocess frames
-            processed_frames = [self._preprocess_image(triplet_frames[j]) for j in range(3)]
+            # Preprocess frames - keep spatial structure for conditioning frames
+            # This allows stacking on channel axis for better local attention
+            processed_frame0_spatial = self._preprocess_image(triplet_frames[0], keep_spatial=True)  # (H, W, 2)
+            processed_frame1_spatial = self._preprocess_image(triplet_frames[1], keep_spatial=True)  # (H, W, 2)
+            processed_frame2_flat = self._preprocess_image(triplet_frames[2], keep_spatial=False)    # (H*W*2,)
             
             # Convert actions to one-hot
             onehot_actions = [self._action_to_onehot(triplet_actions[j]) for j in range(3)]
             
-            # Condition: frames 0,1 + actions 0,1 (what we know)
+            # Condition: Stack frames 0,1 on channel axis for local attention
+            # This keeps corresponding spatial positions close in the flattened array
+            # Shape: (H, W, 2) + (H, W, 2) → (H, W, 4) → flatten to (H*W*4,)
+            stacked_conditioning_frames = jnp.concatenate([
+                processed_frame0_spatial,
+                processed_frame1_spatial
+            ], axis=-1)  # Stack on channel axis: (H, W, 4)
+            
+            condition_frames_flat = stacked_conditioning_frames.reshape(-1)  # Flatten: (H*W*4,)
+            
+            # Append actions after the stacked frames
             condition_data = jnp.concatenate([
-                processed_frames[0],
-                onehot_actions[0],
-                processed_frames[1],
-                onehot_actions[1],
+                condition_frames_flat,  # Stacked frames: (H*W*4,)
+                onehot_actions[0],      # Action 0: (4,)
+                onehot_actions[1],      # Action 1: (4,)
             ])
             
             # Target: frame 2 + action 2 (what we want to predict)
             target_data = jnp.concatenate([
-                processed_frames[2],
-                onehot_actions[2],
+                processed_frame2_flat,  # Frame 2: (H*W*2,)
+                onehot_actions[2],      # Action 2: (4,)
             ])
             
             triplets.append((condition_data, target_data))

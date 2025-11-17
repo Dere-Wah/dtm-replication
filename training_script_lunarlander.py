@@ -7,7 +7,10 @@ The model learns to predict the next frame given the previous 2 frames and actio
 Key features:
 - Iterator-based data loading (no full dataset in memory)
 - CONDITIONAL generation (conditioned on previous frames + actions)
-- RGB images (32x32 with 3 color channels = 3072 pixels per frame)
+- 3-class images (32x32 single channel with 3 classes = 1024 pixels per frame)
+  - Class 0: Black background
+  - Class 1: Terrain and other elements
+  - Class 2: Purple lunar lander
 - Triplet-based training: predict frame[2] + action[2] given frames[0:2] + actions[0:2]
 - On-the-fly data generation from LunarLander-v3 environment
 """
@@ -29,25 +32,28 @@ data_params = {
 }
 
 # ---------- Graph parameters ----------
-# Configured for CONDITIONAL training with triplets:
-# - Target: 1 frame (3072 pixels) + 1 action (4 classes) = 3076 nodes
-# - Condition: 2 frames (6144 pixels) + 2 actions (8 classes) = 6152 nodes
-# Total visible nodes = 3076 + 6152 = 9228 nodes
-# We need grid capacity > 9228, so use 140x140 grid (capacity = 9800)
+# Configured for CONDITIONAL training with triplets using 3-class representation:
+# - Each pixel with 3 classes requires 2 binary nodes in the graph
+# - Target: 1 frame (1024 pixels × 2 = 2048 bits) + 1 action (4 bits) = 2052 nodes
+# - Condition: 2 frames STACKED on channel axis for local attention
+#   * Frame format: (H, W, 4) where first 2 channels = frame0, last 2 = frame1
+#   * Flattened: (1024 pixels × 4 = 4096 bits) + 2 actions (8 bits) = 4104 nodes
+# Total visible nodes ≈ 6156 nodes (framework reports needing 8208 with overhead)
+# We need grid capacity > 8208, so use 140×140 grid (capacity = 9800)
 graph_params = {
     "graph_preset_architecture": 140_12,  # Grid: side=140, degree=12 (size=19600, capacity=9800)
     "num_label_spots": 1,  # Labels will store conditioning data (2 frames + 2 actions)
-    "grayscale_levels": 1,  # Binary images (1 bit per channel: 0 or 1)
+    "grayscale_levels": 2,  # 3 classes (0, 1, 2): black, terrain, lander (requires 2 bits per pixel)
     "torus": True,
     "base_graph_manager": "poisson_binomial_ising_graph_manager",
 }
 
 # ---------- Sampling (Gibbs/CD) schedule parameters ----------
 sampling_params = {
-    "batch_size": 50,  # Smaller batch size for faster iteration
-    "n_samples": 30,  # Fewer samples for faster training
-    "steps_per_sample": 6,
-    "steps_warmup": 300,  # Reduced warmup
+    "batch_size": 128,  # Smaller batch size for faster iteration
+    "n_samples": 50,  # Fewer samples for faster training
+    "steps_per_sample": 8,
+    "steps_warmup": 400,  # Reduced warmup
     "training_beta": 1.0,
 }
 
@@ -61,7 +67,7 @@ generation_params = {
 
 # ---------- Diffusion schedule (time grid) parameters ----------
 diffusion_schedule_params = {
-    "num_diffusion_steps": 1,  # Start with single step for simplicity
+    "num_diffusion_steps": 3,  # Start with single step for simplicity
     "kind": "log",
     "diffusion_offset": 0.1,
 }
@@ -111,7 +117,7 @@ exp_params = {
 
 # ---------- Training parameters ----------
 n_epochs = 50 # Number of epochs to train
-batches_per_epoch = 10  # Number of batches per epoch (controls epoch length)
+batches_per_epoch = 5  # Number of batches per epoch (controls epoch length)
 evaluate_every = 1  # Evaluate and save every N epochs (0 to disable)
 
 # ---------- LunarLander Data Generator parameters ----------
@@ -144,21 +150,28 @@ cfg = make_cfg(
     wd=wd_params,
 )
 
-# Calculate dimensions for conditional training
-n_image_pixels = 32 * 32 * 3  # 3072 pixels per frame
+# Calculate dimensions for conditional training with 3-class representation
+# With grayscale_levels=2, each pixel is encoded as 2 bits
+n_pixels_per_frame = 32 * 32  # 1024 pixels per frame
+n_bits_per_pixel = 2  # 3 classes require 2 bits per pixel
+n_image_pixels = n_pixels_per_frame * n_bits_per_pixel  # 2048 bits per frame
 n_action_classes = 4  # LunarLander has 4 actions
-n_target_nodes = n_image_pixels + n_action_classes  # 3076 nodes (1 frame + 1 action)
-n_condition_nodes = 2 * n_image_pixels + 2 * n_action_classes  # 6152 nodes (2 frames + 2 actions)
-total_visible_nodes = n_target_nodes + n_condition_nodes  # 9228 nodes
+n_target_nodes = n_image_pixels + n_action_classes  # 2052 nodes (1 frame + 1 action)
+n_condition_nodes = 2 * n_image_pixels + 2 * n_action_classes  # 4104 nodes (2 frames + 2 actions)
+total_visible_nodes = n_target_nodes + n_condition_nodes  # 6156 nodes
 
 print(f"Initializing DTM for CONDITIONAL iterator-based training...")
-print(f"Image dimensions: {gym_params['resolution']}x{gym_params['resolution']} RGB = {n_image_pixels} pixels per frame")
+print(f"Image dimensions: {gym_params['resolution']}x{gym_params['resolution']} with 3 classes = {n_pixels_per_frame} pixels × {n_bits_per_pixel} bits = {n_image_pixels} bits per frame")
+print(f"  Class 0: Black background")
+print(f"  Class 1: Terrain and other elements")
+print(f"  Class 2: Purple lunar lander")
 print(f"Action classes: {n_action_classes}")
 print(f"Target nodes: {n_target_nodes} (1 frame + 1 action)")
 print(f"Condition nodes: {n_condition_nodes} (2 frames + 2 actions)")
-print(f"Total visible nodes: {total_visible_nodes}")
-print(f"Grayscale levels: {graph_params['grayscale_levels']} (binary: each RGB channel is 0 or 1)")
-print(f"Graph capacity: 140x140 grid = {140*140} nodes, capacity = {140*140//2} visible nodes")
+print(f"Total visible nodes (calculated): {total_visible_nodes}")
+print(f"Grayscale levels: {graph_params['grayscale_levels']} (3 classes: 0, 1, 2)")
+print(f"Note: Each pixel requires 2 binary nodes for 3-class representation")
+print(f"Graph capacity: 140×140 grid = {140*140} nodes, capacity = {140*140//2} visible nodes")
 print(f"Batch size: {sampling_params['batch_size']}")
 print(f"Batches per epoch: {batches_per_epoch}")
 

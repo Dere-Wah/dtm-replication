@@ -713,25 +713,50 @@ class DTM:
         to_draw = jnp.clip(to_draw, 0, 1)
         
         # For conditional training, separate image pixels from action data
-        # Detect if this is conditional training by checking if image_size > expected RGB pixels
-        n_image_pixels_only = 32 * 32 * 3  # 3072 for RGB 32x32
-        if image_size > n_image_pixels_only:
-            # Conditional training: separate images from actions
-            to_draw_images = to_draw[:, :n_image_pixels_only]
-            to_draw_actions = to_draw[:, n_image_pixels_only:]
-            actual_image_size = n_image_pixels_only
+        # Detect if this is conditional training by checking if we have more than just image data
+        # Try different representations: RGB (32x32x3=3072), or 3-class 2-bit (32x32x2=2048)
+        n_image_pixels_rgb = 32 * 32 * 3  # 3072 for RGB 32x32
+        n_image_pixels_3class = 32 * 32 * 2  # 2048 for 3-class 2-bit 32x32
+        n_action_bits = 4  # LunarLander has 4 actions
+        
+        # Check if this looks like conditional training (image + action data)
+        if image_size == n_image_pixels_rgb + n_action_bits:
+            # RGB conditional training
+            to_draw_images = to_draw[:, :n_image_pixels_rgb]
+            to_draw_actions = to_draw[:, n_image_pixels_rgb:]
+            actual_image_size = n_image_pixels_rgb
+        elif image_size == n_image_pixels_3class + n_action_bits:
+            # 3-class conditional training
+            to_draw_images = to_draw[:, :n_image_pixels_3class]
+            to_draw_actions = to_draw[:, n_image_pixels_3class:]
+            actual_image_size = n_image_pixels_3class
         else:
-            # Regular training: use all data
+            # Regular training: use all data as image
             to_draw_images = to_draw
             to_draw_actions = None
             actual_image_size = image_size
 
-        # Detect if RGB (3 channels) or grayscale
-        is_rgb = (actual_image_size % 3 == 0) and (int(jnp.sqrt(actual_image_size / 3))**2 * 3 == actual_image_size)
-        if is_rgb:
-            image_side_len = int(jnp.sqrt(actual_image_size / 3))
+        # For 3-class 2-bit representation, decode back to single channel class labels
+        is_3class_2bit = (actual_image_size == n_image_pixels_3class)
+        if is_3class_2bit:
+            # Decode 2-bit representation back to class labels
+            # Shape: (N, 2048) -> (N, 32, 32, 2) -> decode -> (N, 32, 32) -> (N, 1024)
+            N = to_draw_images.shape[0]
+            to_draw_images_reshaped = to_draw_images.reshape(N, 32, 32, 2)
+            # Decode: class = high_bit * 2 + low_bit
+            class_labels = to_draw_images_reshaped[:, :, :, 0].astype(jnp.int32) * 2 + to_draw_images_reshaped[:, :, :, 1].astype(jnp.int32)
+            # Normalize to [0, 1] range (3 classes -> divide by 2)
+            to_draw_images = (class_labels / 2.0).reshape(N, -1)
+            actual_image_size = 32 * 32  # Now 1024 pixels
+            is_rgb = False
+            image_side_len = 32
         else:
-            image_side_len = int(jnp.sqrt(actual_image_size))
+            # Detect if RGB (3 channels) or grayscale
+            is_rgb = (actual_image_size % 3 == 0) and (int(jnp.sqrt(actual_image_size / 3))**2 * 3 == actual_image_size)
+            if is_rgb:
+                image_side_len = int(jnp.sqrt(actual_image_size / 3))
+            else:
+                image_side_len = int(jnp.sqrt(actual_image_size))
 
         fig = draw_image_batch(
             to_draw_images,
@@ -745,8 +770,8 @@ class DTM:
         fig.savefig(f"{filename}_{desc_str}.png")
 
         # For conditional training, also separate actions from FID images
-        if image_size > n_image_pixels_only and images_for_fid is not None:
-            images_for_fid = images_for_fid[:, :n_image_pixels_only]
+        if to_draw_actions is not None and images_for_fid is not None:
+            images_for_fid = images_for_fid[:, :actual_image_size]
 
         # the npz file with precomputed stats for fid eval assumed to be in 
         #   thrmlDenoising/fid/precomputed_stats/{'gs' grayscale or 'bw' black and white}_train.npz
@@ -814,19 +839,37 @@ class DTM:
         schedule = SamplingSchedule(0, n_samples, steps_per_sample)
 
         # For conditional training, separate image pixels from action classes
-        n_image_pixels_only = 32 * 32 * 3  # 3072 for RGB 32x32
-        if self.n_image_pixels > n_image_pixels_only:
-            # Conditional training: use only image pixels for GIF
-            actual_image_pixels = n_image_pixels_only
+        n_image_pixels_rgb = 32 * 32 * 3  # 3072 for RGB 32x32
+        n_image_pixels_3class = 32 * 32 * 2  # 2048 for 3-class 2-bit 32x32
+        n_action_bits = 4  # LunarLander has 4 actions
+        
+        # Detect conditional training by checking if we have image + action data
+        if self.n_image_pixels == n_image_pixels_rgb + n_action_bits:
+            # RGB conditional training
+            actual_image_pixels = n_image_pixels_rgb
+            is_conditional = True
+        elif self.n_image_pixels == n_image_pixels_3class + n_action_bits:
+            # 3-class conditional training
+            actual_image_pixels = n_image_pixels_3class
             is_conditional = True
         else:
             # Regular training: use all pixels
             actual_image_pixels = self.n_image_pixels
             is_conditional = False
 
-        # Detect if RGB (3 channels) or grayscale
+        # Detect if we're using 3-class representation (n_grayscale_levels=2 means 3 classes: 0, 1, 2)
+        is_3class = (self.n_grayscale_levels == 2)
+        
+        # Detect if RGB (3 channels) or grayscale/3-class (single channel)
+        # For 3-class, we still have single channel but will be converted to RGB for visualization
         is_rgb = (actual_image_pixels % 3 == 0) and (int(np.sqrt(actual_image_pixels / 3))**2 * 3 == actual_image_pixels)
-        if is_rgb:
+        
+        if is_3class:
+            # 3-class: 2 bits per pixel, so actual_image_pixels = H*W*2
+            # Calculate side from number of pixels: side = sqrt(actual_image_pixels / 2)
+            side = int(round(np.sqrt(actual_image_pixels / 2)))
+            assert side * side * 2 == actual_image_pixels, f"3-class image bits must be side²×2: {side}²×2={side*side*2} != {actual_image_pixels}"
+        elif is_rgb:
             side = int(round(np.sqrt(actual_image_pixels / 3)))
             assert side * side * 3 == actual_image_pixels, f"RGB image pixels must be side²×3: {side}²×3={side*side*3} != {actual_image_pixels}"
         else:
@@ -838,12 +881,11 @@ class DTM:
         clean_conditioning_actions = None
         clean_ground_truth_frames = None
         clean_ground_truth_actions = None
+        conditioning_samples = []  # Initialize to avoid unbound variable
         
         if is_conditional and data_iterator_factory is not None:
             # Get actual dataset samples for conditioning
             data_iterator = data_iterator_factory()
-            # Get runs_per_label samples from the dataset, randomly selecting from batches
-            conditioning_samples = []
             rng = np.random.RandomState(int(key[0]) % (2**31))  # Create random state from key
             
             # Get one batch and randomly sample from it
@@ -873,20 +915,65 @@ class DTM:
                 clean_ground_truth_actions = []
                 
                 for target, condition in conditioning_samples:
-                    # Condition: 2 frames (6144) + 2 actions (8)
-                    frame0 = condition[:actual_image_pixels]
-                    frame1 = condition[actual_image_pixels:2*actual_image_pixels]
-                    action0_onehot = condition[2*actual_image_pixels:2*actual_image_pixels+4]
-                    action1_onehot = condition[2*actual_image_pixels+4:2*actual_image_pixels+8]
+                    # Condition: Stacked frames (2*actual_image_pixels) + 2 actions (8)
+                    # Frames are stacked on channel axis for local attention
+                    stacked_frames_size = 2 * actual_image_pixels
+                    stacked_frames_flat = condition[:stacked_frames_size]
+                    action0_onehot = condition[stacked_frames_size:stacked_frames_size+4]
+                    action1_onehot = condition[stacked_frames_size+4:stacked_frames_size+8]
                     
-                    # Target: 1 frame (3072) + 1 action (4)
+                    # Target: 1 frame (actual_image_pixels) + 1 action (4)
                     frame2 = target[:actual_image_pixels]
                     action2_onehot = target[actual_image_pixels:actual_image_pixels+4]
                     
-                    # Convert to float and reshape
-                    frame0 = np.array(frame0, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
-                    frame1 = np.array(frame1, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
-                    frame2 = np.array(frame2, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                    # Split stacked frames into frame0 and frame1
+                    if is_3class:
+                        # Stacked: (H*W*4) → (H, W, 4) → split → (H, W, 2) each
+                        stacked_frames = np.array(stacked_frames_flat, dtype=np.int32).reshape(side, side, 4)
+                        frame0 = stacked_frames[:, :, 0:2].reshape(-1)  # First 2 channels
+                        frame1 = stacked_frames[:, :, 2:4].reshape(-1)  # Last 2 channels
+                    elif is_rgb:
+                        # Stacked RGB: (H*W*6) → (H, W, 6) → split → (H, W, 3) each
+                        stacked_frames = np.array(stacked_frames_flat, dtype=np.int32).reshape(side, side, 6)
+                        frame0 = stacked_frames[:, :, 0:3].reshape(-1)
+                        frame1 = stacked_frames[:, :, 3:6].reshape(-1)
+                    else:
+                        # Grayscale stacked: (H*W*2) → (H, W, 2) → split
+                        stacked_frames = np.array(stacked_frames_flat, dtype=np.int32).reshape(side, side, 2)
+                        frame0 = stacked_frames[:, :, 0].reshape(-1)
+                        frame1 = stacked_frames[:, :, 1].reshape(-1)
+                    
+                    # Convert to appropriate format and reshape
+                    if is_3class:
+                        # For 3-class with 2-bit encoding, decode back to class labels
+                        # Frame data is in 2-bit format: [bit0, bit1, bit0, bit1, ...]
+                        # Reshape to (H, W, 2) and decode: class = bit0*2 + bit1
+                        
+                        frame0_2bit = np.array(frame0, dtype=np.int32).reshape(side, side, 2)
+                        frame1_2bit = np.array(frame1, dtype=np.int32).reshape(side, side, 2)
+                        frame2_2bit = np.array(frame2, dtype=np.int32).reshape(side, side, 2)
+                        
+                        # Decode to class labels
+                        frame0_2d = frame0_2bit[..., 0] * 2 + frame0_2bit[..., 1]
+                        frame1_2d = frame1_2bit[..., 0] * 2 + frame1_2bit[..., 1]
+                        frame2_2d = frame2_2bit[..., 0] * 2 + frame2_2bit[..., 1]
+                        
+                        # Convert 3-class to RGB for visualization
+                        def class_to_rgb_local(class_img):
+                            rgb = np.zeros((*class_img.shape, 3), dtype=np.float32)
+                            rgb[class_img == 0] = [0.0, 0.0, 0.0]  # Black
+                            rgb[class_img == 1] = [1.0, 1.0, 1.0]  # White
+                            rgb[class_img == 2] = [128.0/255.0, 102.0/255.0, 230.0/255.0]  # Purple lander
+                            return rgb
+                        
+                        frame0 = class_to_rgb_local(frame0_2d)
+                        frame1 = class_to_rgb_local(frame1_2d)
+                        frame2 = class_to_rgb_local(frame2_2d)
+                    else:
+                        # Regular RGB or grayscale
+                        frame0 = np.array(frame0, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                        frame1 = np.array(frame1, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                        frame2 = np.array(frame2, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
                     
                     # Convert actions from one-hot to int
                     action0 = int(np.argmax(action0_onehot))
@@ -950,6 +1037,7 @@ class DTM:
                     pad=2,
                     steps_per_sample=steps_per_sample,
                     is_rgb=is_rgb,
+                    is_3class=is_3class,  # NEW: Pass 3-class flag for proper visualization
                     clean_conditioning_frames=clean_conditioning_frames if not free else None,
                     clean_conditioning_actions=clean_conditioning_actions if not free else None,
                     clean_ground_truth_frames=clean_ground_truth_frames if not free else None,
