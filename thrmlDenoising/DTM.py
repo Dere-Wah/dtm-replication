@@ -90,7 +90,7 @@ class DTM:
 
     is_smoke_test: bool
 
-    def __init__(self, cfg: Optional[DTMConfig] = None, use_dummy_dataset: bool = False, n_image_pixels: Optional[int] = None):
+    def __init__(self, cfg: Optional[DTMConfig] = None, use_dummy_dataset: bool = False, n_image_pixels: Optional[int] = None, n_label_nodes: Optional[int] = None):
         """Initializes the DTM with configuration, dataset loading, and step setup.
 
         Loads dataset, selects base graph manager based on config, computes diffusion
@@ -100,7 +100,8 @@ class DTM:
         **Arguments:**
         - `cfg`: Optional DTMConfig instance; defaults to values in DTM_config if None.
         - `use_dummy_dataset`: If True, uses a minimal dummy dataset for iterator-based training.
-        - `n_image_pixels`: Required if use_dummy_dataset is True; specifies the number of pixels per image.
+        - `n_image_pixels`: Required if use_dummy_dataset is True; specifies the number of pixels per image (target data size).
+        - `n_label_nodes`: Optional; for conditional training, specifies the size of conditioning data.
         """
         if cfg is None:
             cfg = DTMConfig()
@@ -120,6 +121,7 @@ class DTM:
                 n_image_pixels,
                 cfg.graph.grayscale_levels,
                 n_dummy_samples=cfg.sampling.batch_size,  # Use batch_size samples for initialization
+                n_label_nodes=n_label_nodes,  # Pass conditioning data size for conditional training
             )
         else:
             self.train_dataset, self.test_dataset, self.one_hot_target_labels = load_dataset(
@@ -412,6 +414,9 @@ class DTM:
         - `evaluate_every`: Interval (in epochs) for evaluation and saving (0 to disable).
         """
         start_training_time = time.time()
+        
+        # Store data_iterator_factory for use in generate_gif (for conditional training)
+        self._data_iterator_factory = data_iterator_factory
 
         cp_coeffs = extend_params_or_zeros(self.cfg.cp.correlation_penalty, len(self.steps))
         wd_coeffs = extend_params_or_zeros(self.cfg.wd.weight_decay, len(self.steps))
@@ -468,12 +473,17 @@ class DTM:
                 if batch_count >= batches_per_epoch:
                     break
                 
-                # Unpack batch (should be tuple of (images,))
-                image_batch = batch_data[0]
-                batch_size = image_batch.shape[0]
-                
-                # Generate dummy labels
-                label_batch = label_gen.get_labels(batch_size)
+                # Unpack batch
+                # For conditional training: (target_batch, condition_batch)
+                # For unconditioned: (images,)
+                if len(batch_data) == 2:
+                    # Conditional training
+                    image_batch = batch_data[0]  # targets
+                    label_batch = batch_data[1]  # conditions (used as labels for clamping)
+                else:
+                    # Unconditioned training (backward compatibility)
+                    image_batch = batch_data[0]
+                    label_batch = label_gen.get_labels(image_batch.shape[0])
                 
                 # Train all steps on this batch in parallel
                 keys = jr.split(self._get_new_key(), len(self.steps))
@@ -517,7 +527,7 @@ class DTM:
 
         write(f"total training time: {(time.time() - start_training_time):.0f}\n", self.log_file)
 
-    def _run_denoising(self, key, free: bool, batch_size: int, schedule: SamplingSchedule):
+    def _run_denoising(self, key, free: bool, batch_size: int, schedule: SamplingSchedule, conditioning_data=None):
         """Runs the full reverse diffusion chain to generate samples.
 
         Initializes inputs with noise, then iteratively denoises over reversed steps,
@@ -529,6 +539,7 @@ class DTM:
         - `free`: If True, free generation (no label clamping); else conditional.
         - `batch_size`: Number of samples per condition.
         - `schedule`: Sampling schedule for each denoise call.
+        - `conditioning_data`: Optional actual conditioning data from dataset. Shape: (batch_size, n_label_nodes).
 
         **Returns:**
         - Tuple of image readout list and label readout list, each a list over steps
@@ -545,8 +556,15 @@ class DTM:
         if free:
             label_out = None  # stays None for free gen
         else:
-            assert self.one_hot_target_labels.shape == (n_labels, self.base_graph_manager.n_label_nodes)
-            label_out = jnp.broadcast_to(self.one_hot_target_labels[:, None, :], (n_labels, batch_size, self.base_graph_manager.n_label_nodes))
+            # Use actual conditioning data if provided, otherwise use dummy labels
+            if conditioning_data is not None:
+                # conditioning_data shape: (batch_size, n_label_nodes)
+                # Expand to (n_labels, batch_size, n_label_nodes)
+                label_out = jnp.broadcast_to(conditioning_data[None, :, :], (n_labels, batch_size, self.base_graph_manager.n_label_nodes))
+            else:
+                # Fallback to dummy labels (for backward compatibility)
+                assert self.one_hot_target_labels.shape == (n_labels, self.base_graph_manager.n_label_nodes)
+                label_out = jnp.broadcast_to(self.one_hot_target_labels[:, None, :], (n_labels, batch_size, self.base_graph_manager.n_label_nodes))
         input_in = jnp.broadcast_to(input_data[None, ...], (n_labels,) + input_data.shape)
 
         image_readout_list, label_readout_list = [], []
@@ -693,16 +711,30 @@ class DTM:
             == self.one_hot_target_labels.shape[0] * len(self.steps) * drawn_images_per_digit
         )
         to_draw = jnp.clip(to_draw, 0, 1)
+        
+        # For conditional training, separate image pixels from action data
+        # Detect if this is conditional training by checking if image_size > expected RGB pixels
+        n_image_pixels_only = 32 * 32 * 3  # 3072 for RGB 32x32
+        if image_size > n_image_pixels_only:
+            # Conditional training: separate images from actions
+            to_draw_images = to_draw[:, :n_image_pixels_only]
+            to_draw_actions = to_draw[:, n_image_pixels_only:]
+            actual_image_size = n_image_pixels_only
+        else:
+            # Regular training: use all data
+            to_draw_images = to_draw
+            to_draw_actions = None
+            actual_image_size = image_size
 
         # Detect if RGB (3 channels) or grayscale
-        is_rgb = (image_size % 3 == 0) and (int(jnp.sqrt(image_size / 3))**2 * 3 == image_size)
+        is_rgb = (actual_image_size % 3 == 0) and (int(jnp.sqrt(actual_image_size / 3))**2 * 3 == actual_image_size)
         if is_rgb:
-            image_side_len = int(jnp.sqrt(image_size / 3))
+            image_side_len = int(jnp.sqrt(actual_image_size / 3))
         else:
-            image_side_len = int(jnp.sqrt(image_size))
+            image_side_len = int(jnp.sqrt(actual_image_size))
 
         fig = draw_image_batch(
-            to_draw,
+            to_draw_images,
             self.one_hot_target_labels.shape[0] * len(self.steps),
             drawn_images_per_digit,
             super_columns=2 if self.one_hot_target_labels.shape[0] > 4 else 1,
@@ -711,6 +743,10 @@ class DTM:
         )
         desc_str = "free" if free else "clamped"
         fig.savefig(f"{filename}_{desc_str}.png")
+
+        # For conditional training, also separate actions from FID images
+        if image_size > n_image_pixels_only and images_for_fid is not None:
+            images_for_fid = images_for_fid[:, :n_image_pixels_only]
 
         # the npz file with precomputed stats for fid eval assumed to be in 
         #   thrmlDenoising/fid/precomputed_stats/{'gs' grayscale or 'bw' black and white}_train.npz
@@ -734,6 +770,7 @@ class DTM:
         steps_per_sample: int = 10,
         frame_stride: int = 2,
         fps: int = 800,
+        data_iterator_factory = None,  # NEW: For getting real conditioning frames
     ):
         """Generates and saves GIFs showing the denoising process for free and clamped modes.
 
@@ -746,6 +783,7 @@ class DTM:
         - `runs_per_label`: Number of runs (columns) per label in GIF grid.
         - `frame_stride`: Stride to thin frames for shorter GIFs.
         - `fps`: Frames per second for GIF playback.
+        - `data_iterator_factory`: Factory to create data iterator for getting real conditioning frames (conditional only)
         """
         start_gif_time = time.time()
 
@@ -775,41 +813,164 @@ class DTM:
         n_samples = self.steps[0].generation_spec.schedule.n_warmup // steps_per_sample #run for a total time of warmup in generation spec
         schedule = SamplingSchedule(0, n_samples, steps_per_sample)
 
-        # Detect if RGB (3 channels) or grayscale
-        is_rgb = (self.n_image_pixels % 3 == 0) and (int(np.sqrt(self.n_image_pixels / 3))**2 * 3 == self.n_image_pixels)
-        if is_rgb:
-            side = int(round(np.sqrt(self.n_image_pixels / 3)))
-            assert side * side * 3 == self.n_image_pixels, f"RGB image pixels must be side²×3: {side}²×3={side*side*3} != {self.n_image_pixels}"
+        # For conditional training, separate image pixels from action classes
+        n_image_pixels_only = 32 * 32 * 3  # 3072 for RGB 32x32
+        if self.n_image_pixels > n_image_pixels_only:
+            # Conditional training: use only image pixels for GIF
+            actual_image_pixels = n_image_pixels_only
+            is_conditional = True
         else:
-            side = int(round(np.sqrt(self.n_image_pixels)))
-            assert side * side == self.n_image_pixels, "Grayscale image pixels must be a perfect square for gif generation."
+            # Regular training: use all pixels
+            actual_image_pixels = self.n_image_pixels
+            is_conditional = False
+
+        # Detect if RGB (3 channels) or grayscale
+        is_rgb = (actual_image_pixels % 3 == 0) and (int(np.sqrt(actual_image_pixels / 3))**2 * 3 == actual_image_pixels)
+        if is_rgb:
+            side = int(round(np.sqrt(actual_image_pixels / 3)))
+            assert side * side * 3 == actual_image_pixels, f"RGB image pixels must be side²×3: {side}²×3={side*side*3} != {actual_image_pixels}"
+        else:
+            side = int(round(np.sqrt(actual_image_pixels)))
+            assert side * side == actual_image_pixels, "Grayscale image pixels must be a perfect square for gif generation."
+
+        # For conditional training, get real dataset samples for clean conditioning frames
+        clean_conditioning_frames = None
+        clean_conditioning_actions = None
+        clean_ground_truth_frames = None
+        clean_ground_truth_actions = None
+        
+        if is_conditional and data_iterator_factory is not None:
+            # Get actual dataset samples for conditioning
+            data_iterator = data_iterator_factory()
+            # Get runs_per_label samples from the dataset, randomly selecting from batches
+            conditioning_samples = []
+            rng = np.random.RandomState(int(key[0]) % (2**31))  # Create random state from key
+            
+            # Get one batch and randomly sample from it
+            for i, batch_data in enumerate(data_iterator):
+                targets, conditions = batch_data  # (batch_size, 3076), (batch_size, 6152)
+                batch_size = targets.shape[0]
+                
+                # Randomly select runs_per_label samples from this batch
+                # This gives us triplets from random positions in different episodes
+                if batch_size >= runs_per_label:
+                    selected_indices = rng.choice(batch_size, size=runs_per_label, replace=False)
+                else:
+                    selected_indices = rng.choice(batch_size, size=runs_per_label, replace=True)
+                
+                for idx in selected_indices:
+                    conditioning_samples.append((targets[idx], conditions[idx]))
+                
+                # Got enough samples
+                if len(conditioning_samples) >= runs_per_label:
+                    break
+            
+            if len(conditioning_samples) > 0:
+                # Extract clean frames and actions from the samples
+                clean_conditioning_frames = []
+                clean_conditioning_actions = []
+                clean_ground_truth_frames = []
+                clean_ground_truth_actions = []
+                
+                for target, condition in conditioning_samples:
+                    # Condition: 2 frames (6144) + 2 actions (8)
+                    frame0 = condition[:actual_image_pixels]
+                    frame1 = condition[actual_image_pixels:2*actual_image_pixels]
+                    action0_onehot = condition[2*actual_image_pixels:2*actual_image_pixels+4]
+                    action1_onehot = condition[2*actual_image_pixels+4:2*actual_image_pixels+8]
+                    
+                    # Target: 1 frame (3072) + 1 action (4)
+                    frame2 = target[:actual_image_pixels]
+                    action2_onehot = target[actual_image_pixels:actual_image_pixels+4]
+                    
+                    # Convert to float and reshape
+                    frame0 = np.array(frame0, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                    frame1 = np.array(frame1, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                    frame2 = np.array(frame2, dtype=np.float32).reshape(side, side, 3 if is_rgb else 1)
+                    
+                    # Convert actions from one-hot to int
+                    action0 = int(np.argmax(action0_onehot))
+                    action1 = int(np.argmax(action1_onehot))
+                    action2 = int(np.argmax(action2_onehot))
+                    
+                    clean_conditioning_frames.append([frame0, frame1])
+                    clean_conditioning_actions.append([action0, action1])
+                    clean_ground_truth_frames.append(frame2)
+                    clean_ground_truth_actions.append(action2)
 
         # Run denoising with per-sample retention for GIF frames
         # image_readout_list: list over steps, each of shape (n_labels, batch_size, num_samples, image_block_len)
         for free in [True, False]:
             gif_file = os.path.join(gif_folder, f"{file_name_without_freeness}_{'free' if free else 'clamped'}.gif")
 
+            # Prepare conditioning data for clamped generation
+            cond_data_for_generation = None
+            if not free and is_conditional and len(conditioning_samples) > 0:
+                # Use actual conditioning data from dataset
+                cond_batch = []
+                for i in range(min(runs_per_label, len(conditioning_samples))):
+                    _, condition = conditioning_samples[i]
+                    cond_batch.append(np.array(condition))
+                # Pad if needed
+                while len(cond_batch) < runs_per_label:
+                    cond_batch.append(cond_batch[-1])
+                cond_data_for_generation = jnp.array(np.stack(cond_batch[:runs_per_label]))
+
             image_readout_list, label_readout_list = self._run_denoising(
                 key,
                 free,
                 runs_per_label,
                 schedule,
+                conditioning_data=cond_data_for_generation,
             )
 
-            denoise_arrays_to_gif(
-                image_readout_list,
-                gif_file,
-                n_grayscale_levels=self.n_grayscale_levels,
-                runs_per_label=runs_per_label,
-                frame_stride=frame_stride,
-                fps=fps,
-                image_side_len=side,
-                pad=1,
-                label_readout_list=label_readout_list,
-                enable_label_bars=True,
-                steps_per_sample=steps_per_sample,
-                is_rgb=is_rgb,
-            )
+            # For conditional training, use custom GIF visualization
+            if is_conditional:
+                # Use custom conditional GIF that shows conditioning frames + denoising
+                from thrmlDenoising.conditional_gif_utils import denoise_conditional_arrays_to_gif
+                
+                # Extract only image pixels from image_readout_list for denoising visualization
+                image_readout_list_processed = []
+                for img_array in image_readout_list:
+                    # img_array has shape (n_labels, runs, n_samples, 3076)
+                    # Extract only image pixels: (n_labels, runs, n_samples, 3072)
+                    img_only = img_array[..., :actual_image_pixels]
+                    image_readout_list_processed.append(img_only)
+                
+                # Call custom conditional GIF generator with clean frames
+                denoise_conditional_arrays_to_gif(
+                    image_readout_list_processed,
+                    label_readout_list,
+                    gif_file,
+                    n_grayscale_levels=self.n_grayscale_levels,
+                    runs_per_label=runs_per_label,
+                    frame_stride=frame_stride,
+                    fps=fps,
+                    image_side_len=side,
+                    pad=2,
+                    steps_per_sample=steps_per_sample,
+                    is_rgb=is_rgb,
+                    clean_conditioning_frames=clean_conditioning_frames if not free else None,
+                    clean_conditioning_actions=clean_conditioning_actions if not free else None,
+                    clean_ground_truth_frames=clean_ground_truth_frames if not free else None,
+                    clean_ground_truth_actions=clean_ground_truth_actions if not free else None,
+                )
+            else:
+                # Standard unconditioned GIF
+                denoise_arrays_to_gif(
+                    image_readout_list,
+                    gif_file,
+                    n_grayscale_levels=self.n_grayscale_levels,
+                    runs_per_label=runs_per_label,
+                    frame_stride=frame_stride,
+                    fps=fps,
+                    image_side_len=side,
+                    pad=1,
+                    label_readout_list=label_readout_list,
+                    enable_label_bars=True,
+                    steps_per_sample=steps_per_sample,
+                    is_rgb=is_rgb,
+                )
 
         write(f"Time to generate gifs: {time.time() - start_gif_time:.1f}s\n")
 
@@ -978,7 +1139,9 @@ class DTM:
             fid_str = f"Epoch {epoch} (FID not computed) "
 
         if self.cfg.exp.generate_gif:
-            self.generate_gif(epoch, self.cfg.exp.animated_images_per_digit, self.cfg.exp.steps_per_sample_in_gif)
+            # Pass data_iterator_factory if available (for conditional GIF with clean frames)
+            data_factory = getattr(self, '_data_iterator_factory', None)
+            self.generate_gif(epoch, self.cfg.exp.animated_images_per_digit, self.cfg.exp.steps_per_sample_in_gif, data_iterator_factory=data_factory)
 
         fid_clamped = self.do_draw_and_fid(
             self._get_new_key(), fig_filename, free=False

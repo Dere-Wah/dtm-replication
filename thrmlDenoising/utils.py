@@ -80,6 +80,7 @@ def create_dummy_dataset_for_iterator(
     n_image_pixels: int,
     n_grayscale_levels: int,
     n_dummy_samples: int = 10,
+    n_label_nodes: Optional[int] = None,
 ) -> tuple[dict, dict, Array]:
     """Create a minimal dummy dataset for iterator-based training.
     
@@ -87,15 +88,18 @@ def create_dummy_dataset_for_iterator(
     The dummy dataset is only used for initialization and to determine dimensions.
     
     Args:
-        n_image_pixels: Number of pixels per image
+        n_image_pixels: Number of pixels per image (target data size)
         n_grayscale_levels: Number of grayscale levels
         n_dummy_samples: Number of dummy samples to create (small number for initialization)
+        n_label_nodes: Number of label nodes (for conditional training). If None, defaults to 1.
     
     Returns:
         Tuple of (train_data, test_data, one_hot_labels) compatible with DTM initialization
     """
     # For unconditioned generation, we use a minimal label size of 1
-    n_label_nodes = 1
+    # For conditional generation, this should be the size of conditioning data
+    if n_label_nodes is None:
+        n_label_nodes = 1
     
     # Create dummy data with correct shapes
     if n_grayscale_levels == 1:

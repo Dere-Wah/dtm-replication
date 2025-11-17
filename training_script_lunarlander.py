@@ -1,14 +1,14 @@
 """
-Training script for DTM with LunarLander environment using iterator-based data loading.
+Training script for CONDITIONAL DTM with LunarLander environment using iterator-based data loading.
 
-This script demonstrates how to train a DTM on data generated on-the-fly from a gym environment,
-without needing to load a full dataset into memory. The model is trained in an unconditioned manner
-to generate random LunarLander frames.
+This script demonstrates how to train a conditional DTM on data generated on-the-fly from a gym environment.
+The model learns to predict the next frame given the previous 2 frames and actions.
 
 Key features:
 - Iterator-based data loading (no full dataset in memory)
-- Unconditioned generation (no class labels)
-- RGB images (32x32 with 3 color channels = 3072 pixels)
+- CONDITIONAL generation (conditioned on previous frames + actions)
+- RGB images (32x32 with 3 color channels = 3072 pixels per frame)
+- Triplet-based training: predict frame[2] + action[2] given frames[0:2] + actions[0:2]
 - On-the-fly data generation from LunarLander-v3 environment
 """
 
@@ -17,28 +17,27 @@ sys.path.insert(0, '/home/ubuntu/Extropic_Hackaton')
 
 from thrmlDenoising.DTM import DTM
 from thrmlDenoising.utils import make_cfg
-from thrmlDenoising.iterator_dataloader import IteratorDataLoader
+from thrmlDenoising.conditional_iterator_dataloader import ConditionalIteratorDataLoader
 from src.dataloader import GymDataGenerator
 
 # ---------- Data parameters ----------
-# For iterator-based training with unconditioned generation
+# For iterator-based training with CONDITIONAL generation
 data_params = {
-    "dataset_name": "iterator_lunarlander",  # Custom name for logging
-    "target_classes": (0,),  # Single dummy class for unconditioned generation
+    "dataset_name": "conditional_lunarlander",  # Custom name for logging
+    "target_classes": (0,),  # Single dummy class (not used in conditional training)
     "pixel_threshold_for_single_trials": 0.5,  # Threshold for binarization
 }
 
 # ---------- Graph parameters ----------
-# Configured for 32x32 RGB images (3072 pixels total)
-# IMPORTANT: With PoissonBinomialIsingGraphManager, each pixel needs n_trials=grayscale_levels spins
-# So total nodes = n_pixels × grayscale_levels = 3072 × grayscale_levels
-# Must satisfy: n_pixels × grayscale_levels < grid_size/2
+# Configured for CONDITIONAL training with triplets:
+# - Target: 1 frame (3072 pixels) + 1 action (4 classes) = 3076 nodes
+# - Condition: 2 frames (6144 pixels) + 2 actions (8 classes) = 6152 nodes
+# Total visible nodes = 3076 + 6152 = 9228 nodes
+# We need grid capacity > 9228, so use 140x140 grid (capacity = 9800)
 graph_params = {
-    "graph_preset_architecture": 80_12,  # Grid: side=80, degree=12 (size=6400, capacity=3200)
-    "num_label_spots": 1,  # Minimal labels for unconditioned generation
+    "graph_preset_architecture": 140_12,  # Grid: side=140, degree=12 (size=19600, capacity=9800)
+    "num_label_spots": 1,  # Labels will store conditioning data (2 frames + 2 actions)
     "grayscale_levels": 1,  # Binary images (1 bit per channel: 0 or 1)
-                            # Using 1 means: 3072 pixels × 1 = 3072 nodes (fits in 3200 capacity)
-                            # Using 4 would mean: 3072 × 4 = 12,288 nodes (too large!)
     "torus": True,
     "base_graph_manager": "poisson_binomial_ising_graph_manager",
 }
@@ -101,7 +100,7 @@ wd_params = {
 exp_params = {
     "seed": 42,
     "graph_seeds": (),
-    "descriptor": "lunarlander_rgb",
+    "descriptor": "lunarlander_conditional",
     "n_cores": 1,
     "compute_autocorr": False,  # Disabled for iterator training (requires test dataset)
     "generate_gif": True,  # Now supports RGB GIF generation!
@@ -111,17 +110,16 @@ exp_params = {
 }
 
 # ---------- Training parameters ----------
-n_epochs = 20  # Number of epochs to train
-batches_per_epoch = 100  # Number of batches per epoch (controls epoch length)
+n_epochs = 50 # Number of epochs to train
+batches_per_epoch = 10  # Number of batches per epoch (controls epoch length)
 evaluate_every = 1  # Evaluate and save every N epochs (0 to disable)
 
 # ---------- LunarLander Data Generator parameters ----------
-# IMPORTANT: Now using ALL frames from each episode (not just the last one!)
-# Each episode with state_size=32 yields 32 individual training frames
+# IMPORTANT: Each episode with state_size=32 yields 10 triplets (30 frames used, 2 discarded)
 gym_params = {
     "state_size": 32,  # Number of frames to collect per episode
     "environment_name": "LunarLander-v3",
-    "training_examples": 160,  # Episodes per epoch (each yields 32 frames = ~5120 training samples)
+    "training_examples": 500,  # Episodes per epoch (each yields 10 triplets = 5000 training samples)
     "autoencoder_time_compression": 4,
     "return_anyways": True,  # Return frames even if lander leaves the frame
     "resolution": 32,  # 32x32 resolution (matches graph parameters)
@@ -129,8 +127,8 @@ gym_params = {
 
 # Data efficiency calculation:
 # - batches_per_epoch=100 × batch_size=50 = 5000 samples needed per epoch
-# - training_examples=160 episodes × state_size=32 frames = 5120 frames available
-# - Perfect! Just enough data to fill all batches without repetition
+# - training_examples=500 episodes × 10 triplets = 5000 triplets available
+# - Perfect! Exactly enough triplets to fill all batches without repetition
 
 # Build the config
 cfg = make_cfg(
@@ -146,19 +144,29 @@ cfg = make_cfg(
     wd=wd_params,
 )
 
-# Calculate n_image_pixels for RGB 32x32 images
-n_image_pixels = 32 * 32 * 3  # 3072 pixels
+# Calculate dimensions for conditional training
+n_image_pixels = 32 * 32 * 3  # 3072 pixels per frame
+n_action_classes = 4  # LunarLander has 4 actions
+n_target_nodes = n_image_pixels + n_action_classes  # 3076 nodes (1 frame + 1 action)
+n_condition_nodes = 2 * n_image_pixels + 2 * n_action_classes  # 6152 nodes (2 frames + 2 actions)
+total_visible_nodes = n_target_nodes + n_condition_nodes  # 9228 nodes
 
-print(f"Initializing DTM for iterator-based training...")
-print(f"Image dimensions: {gym_params['resolution']}x{gym_params['resolution']} RGB = {n_image_pixels} pixels")
+print(f"Initializing DTM for CONDITIONAL iterator-based training...")
+print(f"Image dimensions: {gym_params['resolution']}x{gym_params['resolution']} RGB = {n_image_pixels} pixels per frame")
+print(f"Action classes: {n_action_classes}")
+print(f"Target nodes: {n_target_nodes} (1 frame + 1 action)")
+print(f"Condition nodes: {n_condition_nodes} (2 frames + 2 actions)")
+print(f"Total visible nodes: {total_visible_nodes}")
 print(f"Grayscale levels: {graph_params['grayscale_levels']} (binary: each RGB channel is 0 or 1)")
-print(f"Graph capacity: 80x80 grid = {80*80} nodes, capacity = {80*80//2} visible nodes")
-print(f"Required nodes: {n_image_pixels} pixels × {graph_params['grayscale_levels']} levels = {n_image_pixels * graph_params['grayscale_levels']} nodes")
+print(f"Graph capacity: 140x140 grid = {140*140} nodes, capacity = {140*140//2} visible nodes")
 print(f"Batch size: {sampling_params['batch_size']}")
 print(f"Batches per epoch: {batches_per_epoch}")
 
 # Create DTM with dummy dataset for initialization
-dtm = DTM(cfg, use_dummy_dataset=True, n_image_pixels=n_image_pixels)
+# For conditional training:
+# - n_image_pixels = target data size (frame 2 + action 2)
+# - n_label_nodes = conditioning data size (frames 0,1 + actions 0,1)
+dtm = DTM(cfg, use_dummy_dataset=True, n_image_pixels=n_target_nodes, n_label_nodes=n_condition_nodes)
 
 print(f"DTM initialized successfully!")
 print(f"Model has {len(dtm.steps)} diffusion step(s)")
@@ -169,11 +177,12 @@ def create_data_iterator():
     # Create the gym environment data generator
     gym_generator = GymDataGenerator(**gym_params)
     
-    # Wrap it with our IteratorDataLoader
-    dataloader = IteratorDataLoader(
+    # Wrap it with our ConditionalIteratorDataLoader
+    dataloader = ConditionalIteratorDataLoader(
         data_iterator=iter(gym_generator),
         batch_size=sampling_params['batch_size'],
         n_grayscale_levels=graph_params['grayscale_levels'],  # Will be 1 (binary)
+        n_action_classes=n_action_classes,  # 4 actions for LunarLander
         max_batches_per_epoch=batches_per_epoch,
     )
     
